@@ -1,0 +1,14 @@
+
+
+services:
+  rivalwatch: 
+    image: rivalwatch
+    container_name: rivalwatch-dev
+    working_dir: /app/rivalwatch
+    command: ["bash", "-lc", "sleep infinity"]
+    volumes:
+      - .:/app
+      - pw-cache:/root/.cache/ms-playwright
+
+volumes:
+  pw-cache:

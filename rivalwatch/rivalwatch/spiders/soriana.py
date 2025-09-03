@@ -1,30 +1,12 @@
+# soriana.py
 import json
 import re
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse, quote_plus
 import scrapy
 from scrapy_playwright.page import PageMethod
 
-# --- al tope del archivo, después de imports ---
-PRODUCT_URL_RE = re.compile(r"/\d+\.html(?:\?.*)?$", re.IGNORECASE)
-NON_PRODUCT_BLOCKLIST = (
-    "/static-pages/",
-    "/recarga-",
-    "/responsabilidad-social",
-    "/terminos-",
-    "/aviso-de-privacidad",
-    "/facturacion",
-)
 
-def _looks_like_product_url(url: str) -> bool:
-    if any(bad in url for bad in NON_PRODUCT_BLOCKLIST):
-        return False
-    return bool(PRODUCT_URL_RE.search(url))
-
-def _sku_from_url(url: str) -> str | None:
-    m = re.search(r"/(\d+)\.html", url)
-    return m.group(1) if m else None
-
-# ---------- helpers ----------
 def _to_float(x: str) -> float | None:
     if not x:
         return None
@@ -39,6 +21,7 @@ def _to_float(x: str) -> float | None:
             except InvalidOperation:
                 return None
     return None
+
 
 def _extract_currency(response) -> str | None:
     cur = response.css('input#clevertap-currency::attr(value)').get()
@@ -62,194 +45,200 @@ def _extract_currency(response) -> str | None:
             pass
     return None
 
-def _regex_product_links(html: str) -> list[str]:
-    """
-    Fallback súper robusto: pesca URLs que terminen en .html y parezcan ficha.
-    Ej: /aceite-.../1919311.html
-    """
-    links = set()
-    for m in re.finditer(r'href="([^"]+?/\d+\.html)"', html):
-        links.add(m.group(1))
-    # A veces vienen sin el /digits.html, intenta .html genérico:
-    for m in re.finditer(r'href="([^"]+?\.html)"', html):
-        links.add(m.group(1))
-    return list(links)
 
-# ---------- spider ----------
+def _extract_sku(response, url: str) -> str | None:
+    # 1) atributo data-sku o nodos visibles
+    sku = response.css("[data-sku]::attr(data-sku)").get()
+    if sku:
+        return sku.strip()
+    sku = (response.css(".sku::text").get() or "").strip() or (response.css('[itemprop="sku"]::attr(content)').get() or "").strip()
+    if sku:
+        return sku
+
+    # 2) JSON-LD
+    for txt in response.css('script[type="application/ld+json"]::text').getall():
+        try:
+            data = json.loads(txt)
+            nodes = data if isinstance(data, list) else [data]
+            for n in nodes:
+                if isinstance(n, dict):
+                    pid = n.get("sku") or n.get("productID") or n.get("mpn")
+                    if pid:
+                        return str(pid).strip()
+        except Exception:
+            pass
+
+    # 3) fallback: dígitos del final de la URL (VTEX suele tener .../1234567.html)
+    path = urlparse(url).path or ""
+    m = re.search(r"/(\d{5,})\.html", path)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _title_contains_all_terms(title: str, terms: list[str]) -> bool:
+    t = title.lower()
+    return all(term.lower() in t for term in terms if term)
+
+
 class SorianaSpider(scrapy.Spider):
     name = "soriana"
     allowed_domains = ["soriana.com"]
 
-    # Ajustes específicos del spider para Playwright y timeouts
-    custom_settings = {
-        "PLAYWRIGHT_BROWSER_TYPE": "chromium",
-        "PLAYWRIGHT_LAUNCH_OPTIONS": {"headless": True, "args": ["--no-sandbox", "--disable-gpu"]},
-        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 90000,  # 90s
-        "PLAYWRIGHT_PAGE_GOTO_WAIT_UNTIL": "domcontentloaded",
-        # Mantén tu throttling global en settings.py
-    }
-
+    # punto de entrada por defecto: departamento
     start_urls = [
         "https://www.soriana.com/despensa/",
     ]
 
-    # --------- ARRANQUE ---------
+    custom_settings = {
+        "PLAYWRIGHT_BROWSER_TYPE": "chromium",
+        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 45_000,
+        "PLAYWRIGHT_LAUNCH_OPTIONS": {"headless": True},
+        "CONCURRENT_REQUESTS": 8,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0.5,
+        "RETRY_TIMES": 3,
+        "ROBOTSTXT_OBEY": True,
+    }
+
+    # -------- ARRANQUE --------
     def start_requests(self):
-        # A) URLs específicas de producto (más rápido, sin JS)
+        """
+        Modos soportados:
+        - -a product_urls="url1,url2,..."
+        - -a query="nombre 1, nombre 2"
+        - default: start_urls (categorías)
+        Adicional:
+        - -a max_products=NN
+        - -a max_pages=NN
+        - -a require_terms=true (filtra resultados que no contengan todas las palabras del query)
+        """
+        self.max_products = int(getattr(self, "max_products", 0)) or None
+        self.max_pages = int(getattr(self, "max_pages", 0)) or None
+        self.require_terms = str(getattr(self, "require_terms", "false")).lower() in ("1", "true", "yes")
+
         product_urls = getattr(self, "product_urls", None)
         if product_urls:
             for url in [u.strip() for u in product_urls.split(",") if u.strip()]:
                 yield scrapy.Request(url, callback=self.parse_product, meta={"playwright": False})
             return
 
-        # B) Búsquedas por query (usa JS para asegurar listado)
         query = getattr(self, "query", None)
         if query:
             for q in [t.strip() for t in query.split(",") if t.strip()]:
-                url = f"https://www.soriana.com/search/?text={q.replace(' ', '+')}"
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                # AQUÍ el cambio a /buscar?q= usando quote_plus
+                search_url = f"https://www.soriana.com/buscar?q={quote_plus(q)}"
+                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
                 yield scrapy.Request(
-                    url,
-                    callback=self.parse_category,
+                    search_url,
+                    callback=self.parse_search,
+                    cb_kwargs={"query_terms": [w for w in q.split() if w]},
                     meta={
                         "playwright": True,
-                        "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 60000},
                         "playwright_page_methods": [
+                            PageMethod("route", "**/*", self._route_block_noise),
                             PageMethod("wait_for_load_state", "domcontentloaded"),
                             PageMethod("wait_for_load_state", "networkidle"),
-                            PageMethod("wait_for_timeout", 1200),
+                            # al menos un link de producto visible
+                            PageMethod(
+                                "wait_for_selector",
+                                "a.vtex-product-summary-2-x-clearLink, a[data-testid='productSummaryLink'], a[href$='.html']",
+                                timeout=20_000,
+                            ),
                         ],
-                        "page_no": 1,
                     },
+                    dont_filter=True,
                 )
             return
 
-        # C) Categorías (como /despensa/)
-        max_pages = int(getattr(self, "max_pages", 1))
+        # Categorías por defecto (departamentos)
         for url in self.start_urls:
             yield scrapy.Request(
                 url,
                 callback=self.parse_category,
                 meta={
                     "playwright": True,
-                    "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 60000},
                     "playwright_page_methods": [
+                        PageMethod("route", "**/*", self._route_block_noise),
                         PageMethod("wait_for_load_state", "domcontentloaded"),
                         PageMethod("wait_for_load_state", "networkidle"),
                         PageMethod("wait_for_timeout", 1200),
                     ],
-                    "page_no": 1,
-                    "max_pages": max_pages,
                 },
             )
 
-    # --------- LISTA / CATEGORÍA ---------
+    # -------- LISTADO: BÚSQUEDA --------
+    def parse_search(self, response, query_terms: list[str]):
+        yielded = 0
+        for url in self._iter_product_links(response):
+            if self.require_terms:
+                # filtramos por título de la tarjeta cuando esté disponible
+                card_title = (
+                    response.xpath(f'//a[@href="{urlparse(url).path}"]//text()').get()
+                    or ""
+                ).strip()
+                if card_title and not _title_contains_all_terms(card_title, query_terms):
+                    continue
+            yield scrapy.Request(url, callback=self.parse_product, meta={"playwright": False})
+            yielded += 1
+            if self.max_products and yielded >= self.max_products:
+                break
+
+        # Paginación
+        if (not self.max_products) or (yielded < self.max_products):
+            next_url = self._find_next_page(response)
+            if next_url and (not self.max_pages or response.meta.get("page_no", 1) < self.max_pages):
+                yield scrapy.Request(
+                    response.urljoin(next_url),
+                    callback=self.parse_search,
+                    cb_kwargs={"query_terms": query_terms},
+                    meta={
+                        "playwright": True,
+                        "page_no": response.meta.get("page_no", 1) + 1,
+                        "playwright_page_methods": [
+                            PageMethod("route", "**/*", self._route_block_noise),
+                            PageMethod("wait_for_load_state", "domcontentloaded"),
+                            PageMethod("wait_for_load_state", "networkidle"),
+                            PageMethod("wait_for_timeout", 1000),
+                        ],
+                    },
+                )
+
+    # -------- LISTADO: CATEGORÍA --------
     def parse_category(self, response):
-        page_no = response.meta.get("page_no", 1)
-        max_pages = int(response.meta.get("max_pages", 1))
+        yielded = 0
+        for url in self._iter_product_links(response):
+            yield scrapy.Request(url, callback=self.parse_product, meta={"playwright": False})
+            yielded += 1
+            if self.max_products and yielded >= self.max_products:
+                break
 
-        # 1) Intenta selectores típicos VTEX
-        product_link_selectors = [
-            'a.vtex-product-summary-2-x-clearLink::attr(href)',
-            'a.product-card__link::attr(href)',
-            'a.product-item__link::attr(href)',
-            'section [data-sku] a::attr(href)',
-            'a[data-testid="productSummaryLink"]::attr(href)',
-            'a[href*="/p/"]::attr(href)',
-            'a[href$=".html"]::attr(href)',
-        ]
+        if (not self.max_products) or (yielded < self.max_products):
+            next_url = self._find_next_page(response)
+            if next_url and (not self.max_pages or response.meta.get("page_no", 1) < self.max_pages):
+                yield scrapy.Request(
+                    response.urljoin(next_url),
+                    callback=self.parse_category,
+                    meta={
+                        "playwright": True,
+                        "page_no": response.meta.get("page_no", 1) + 1,
+                        "playwright_page_methods": [
+                            PageMethod("route", "**/*", self._route_block_noise),
+                            PageMethod("wait_for_load_state", "domcontentloaded"),
+                            PageMethod("wait_for_load_state", "networkidle"),
+                            PageMethod("wait_for_timeout", 1000),
+                        ],
+                    },
+                )
 
-        seen = set()
-        for sel in product_link_selectors:
-            for href in response.css(sel).getall():
-                href = href.strip()
-                if not href:
-                    continue
-                url = response.urljoin(href)
-                if url in seen:
-                    continue
-                # nuevo: filtra solo fichas válidas
-                if not _looks_like_product_url(url):
-                    continue
-                seen.add(url)
-                yield scrapy.Request(url, callback=self.parse_product, meta={"playwright": False})
-
-        # 2) Si no encontró nada, reintenta UNA vez con JS largo esperando algún patrón
-        if not seen and not response.meta.get("js_retried"):
-            yield response.request.replace(
-                meta={
-                    **response.meta,
-                    "playwright": True,
-                    "js_retried": True,
-                    "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 90000},
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_load_state", "domcontentloaded"),
-                        PageMethod("wait_for_load_state", "networkidle"),
-                        # prueba varios selectores comunes; si alguno aparece, seguimos
-                        PageMethod("wait_for_selector", 'a[href$=".html"]', timeout=25000),
-                    ],
-                },
-                dont_filter=True,
-            )
-            return
-
-        # 3) Fallback: regex en el HTML crudo (agarra /xxxx.html)
-        if not seen:
-              for href in _regex_product_links(response.text):
-                url = response.urljoin(href)
-                if url in seen:
-                    continue
-                if not _looks_like_product_url(url):
-                    continue
-                seen.add(url)
-                yield scrapy.Request(url, callback=self.parse_product, meta={"playwright": False})
-
-        # 4) Paginación (si el spider recibió max_pages>1)
-        if page_no < max_pages:
-            # Busca rel=next u otros:
-            next_selectors = [
-                'a[rel="next"]::attr(href)',
-                'link[rel="next"]::attr(href)',
-                'a.pagination-next::attr(href)',
-                'a.pagination__next::attr(href)',
-                'a[aria-label="Siguiente"]::attr(href)',
-            ]
-            next_url = None
-            for nsel in next_selectors:
-                next_url = response.css(nsel).get()
-                if next_url:
-                    break
-
-            # Si no hay rel=next visible, intenta patrón de ?page=
-            if not next_url:
-                m = re.search(r'[?&]page=(\d+)', response.url)
-                next_page = (int(m.group(1)) + 1) if m else (page_no + 1)
-                base = re.sub(r'([?&])page=\d+', r'\1', response.url)  # limpia page existente
-                sep = '&' if '?' in base else '?'
-                next_url = f"{base}{sep}page={next_page}"
-
-            yield scrapy.Request(
-                response.urljoin(next_url),
-                callback=self.parse_category,
-                meta={
-                    "playwright": True,
-                    "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 60000},
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_load_state", "domcontentloaded"),
-                        PageMethod("wait_for_load_state", "networkidle"),
-                        PageMethod("wait_for_timeout", 800),
-                    ],
-                    "page_no": page_no + 1,
-                    "max_pages": max_pages,
-                },
-            )
-
-    # --------- FICHA ---------
+    # -------- FICHA DE PRODUCTO --------
     def parse_product(self, response):
-        # precio desde input oculto
+        # Precio desde input oculto
         price_raw = response.css('input#clevertap-price::attr(value)').get()
         price = _to_float(price_raw)
 
-        # JSON-LD fallback
+        # Fallback JSON-LD si no hay input
         if price is None:
             for txt in response.css('script[type="application/ld+json"]::text').getall():
                 try:
@@ -269,20 +258,18 @@ class SorianaSpider(scrapy.Spider):
                 except Exception:
                     pass
 
-        # Si aún nada y veníamos sin JS, reintenta 1 vez con JS (por si el input lo inyecta el frontend)
+        # Reintento único con JS si sigue sin precio
         tried_js = response.meta.get("tried_js")
-
-# si la URL no es de ficha, no reintentes con JS (evita timeouts en páginas informativas)
-        if price is None and not tried_js and _looks_like_product_url(response.url):
+        if price is None and not tried_js:
             yield response.request.replace(
                 meta={
                     "playwright": True,
                     "tried_js": True,
-                    "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 60000},
                     "playwright_page_methods": [
+                        PageMethod("route", "**/*", self._route_block_noise),
                         PageMethod("wait_for_load_state", "domcontentloaded"),
                         PageMethod("wait_for_load_state", "networkidle"),
-                        PageMethod("wait_for_selector", "#clevertap-price", timeout=20000),
+                        PageMethod("wait_for_selector", "#clevertap-price", timeout=20_000),
                     ],
                 },
                 dont_filter=True,
@@ -291,33 +278,7 @@ class SorianaSpider(scrapy.Spider):
 
         currency = _extract_currency(response) or "MXN"
         title = (response.css("h1::text").get() or "").strip()
-
-        # SKU robusto: data-sku, meta og, JSON-LD u otro texto
-        sku = (
-            response.css("[data-sku]::attr(data-sku)").get()
-            or response.css('meta[property="product:retailer_item_id"]::attr(content)').get()
-            or response.css(".sku::text").get()
-            or ""
-        )
-        sku = sku.strip() if sku else sku
-
-        # Último intento de SKU vía JSON-LD
-        if not sku:
-            for txt in response.css('script[type="application/ld+json"]::text').getall():
-                try:
-                    data = json.loads(txt)
-                    nodes = data if isinstance(data, list) else [data]
-                    for n in nodes:
-                        if isinstance(n, dict):
-                            s = n.get("sku")
-                            if s:
-                                sku = str(s).strip()
-                                break
-                    if sku:
-                        break
-                except Exception:
-                    pass
-
+        sku = _extract_sku(response, response.url)
         in_stock = bool(response.css(".in-stock, .available, [data-availability='inStock']"))
 
         yield {
@@ -330,3 +291,64 @@ class SorianaSpider(scrapy.Spider):
             "currency": currency,
             "in_stock": in_stock,
         }
+
+    # -------- Utilidades de listado --------
+    def _iter_product_links(self, response):
+        """
+        Devuelve URLs absolutas de fichas de producto, evitando enlaces a páginas estáticas.
+        """
+        sels = [
+            'a.vtex-product-summary-2-x-clearLink::attr(href)',
+            'a.product-card__link::attr(href)',
+            'a.product-item__link::attr(href)',
+            'section [data-sku] a::attr(href)',
+            'a[data-testid="productSummaryLink"]::attr(href)',
+            # fallback general: páginas con .../NNNNN.html
+            'a[href$=".html"]::attr(href)',
+        ]
+        seen = set()
+        for sel in sels:
+            for href in response.css(sel).getall():
+                href = href.strip()
+                if not href:
+                    continue
+                abs_url = response.urljoin(href)
+                # filtrar obvios NO-producto
+                if any(x in abs_url for x in ("/static-pages/", "/blog/", "/tiendas/", "/servicios/")):
+                    continue
+                # VTEX producto típico termina en .html y suele incluir un id numérico
+                if not abs_url.endswith(".html"):
+                    continue
+                if abs_url in seen:
+                    continue
+                seen.add(abs_url)
+                yield abs_url
+
+    def _find_next_page(self, response) -> str | None:
+        for nsel in [
+            'a[rel="next"]::attr(href)',
+            'link[rel="next"]::attr(href)',
+            'a.pagination-next::attr(href)',
+            'a.pagination__next::attr(href)',
+            'a[aria-label="Siguiente"]::attr(href)',
+        ]:
+            url = response.css(nsel).get()
+            if url:
+                return url
+        # algunos listados usan ?page=2,3... en el mismo path
+        m = re.search(r'(?:[?&])page=(\d+)', response.url)
+        if m:
+            cur = int(m.group(1))
+            return re.sub(r'(?:[?&])page=\d+', f'?page={cur+1}', response.url)
+        return None
+
+    # -------- Playwright: bloquear ruido --------
+    async def _route_block_noise(self, route, request):
+        """Bloquea recursos pesados: imágenes, fuentes y tracking para acelerar listados."""
+        rtype = request.resource_type
+        if rtype in ("image", "font", "media"):
+            return await route.abort()
+        url = request.url
+        if any(d in url for d in ("google-analytics.com", "googletagmanager.com", "facebook.net", "doubleclick.net")):
+            return await route.abort()
+        return await route.continue_()
