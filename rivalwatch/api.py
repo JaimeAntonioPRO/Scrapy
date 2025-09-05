@@ -1,3 +1,9 @@
+# --- AÑADE ESTAS DOS LÍNEAS AL INICIO DEL ARCHIVO ---
+import asyncio
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# ----
+
+
 # 1. Importar las librerías necesarias
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -69,6 +75,10 @@ def get_productos():
 # api.py
 
 # --- ENDPOINT CORRECTO Y SIMPLIFICADO ---
+# api.py
+
+# ... (tus imports y otras funciones se quedan igual)
+
 @app.route('/api/iniciar-spider', methods=['POST'])
 def iniciar_spider():
     data = request.json
@@ -80,23 +90,28 @@ def iniciar_spider():
         return jsonify({"error": "El nombre del spider y el término de búsqueda son requeridos"}), 400
 
     try:
-        # Construimos el comando directamente con los datos recibidos
+        # --- ESTE ES EL NUEVO COMANDO ---
+        # En lugar de 'scrapy crawl', ahora usamos 'docker run'
+        # para lanzar el spider dentro de un contenedor.
         comando = (
+            f"docker run --rm rivalwatch-app "
             f"scrapy crawl {nombre_spider} "
             f"-a query=\"{query}\" "
             f"-a max_products={max_products}"
         )
         
-        # Ejecutamos el comando en segundo plano
-        # Asegúrate de que la terminal donde corres 'python api.py'
-        # esté en la carpeta que contiene 'scrapy.cfg'
+        print(f"Ejecutando comando: {comando}") # Añadimos un print para depurar
+
+        # Ejecutamos el comando de Docker en segundo plano
         subprocess.Popen(comando, shell=True)
 
-        mensaje = f"Spider '{nombre_spider}' iniciado para buscar '{query}' (máx {max_products} productos)."
+        mensaje = f"Contenedor Docker iniciado para el spider '{nombre_spider}'."
         return jsonify({"mensaje": mensaje}), 200
         
     except Exception as e:
-        return jsonify({"error": f"Error al intentar ejecutar el spider: {str(e)}"}), 500
+        return jsonify({"error": f"Error al intentar ejecutar el contenedor Docker: {str(e)}"}), 500
+
+# ... (el resto de tu archivo api.py se queda igual)
 
 # 5. Punto de entrada para ejecutar el servidor Flask
 if __name__ == '__main__':

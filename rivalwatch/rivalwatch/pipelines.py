@@ -1,4 +1,5 @@
 import pyodbc
+from scrapy.exceptions import DropItem # Importamos la excepción especial para descartar items
 
 class SqlServerPipeline:
     def __init__(self):
@@ -13,9 +14,15 @@ class SqlServerPipeline:
         self.cursor = self.connection.cursor()
 
     def process_item(self, item, spider):
+        # --- PASO DE VALIDACIÓN ---
+        # Verificamos que los campos esenciales no estén vacíos o nulos.
+        if not item.get('titulo') or not item.get('precio') or not item.get('url_imagen'):
+            # Si falta algún dato, lanzamos DropItem.
+            # Scrapy lo captura, detiene el procesamiento de este item y lo registra.
+            raise DropItem(f"Item descartado por datos incompletos: {item['titulo']}")
+
+        # Si la validación pasa, continuamos con el proceso de inserción.
         try:
-            # === QUERÍA ACTUALIZADO ===
-            # Usamos los nombres de columna de PRODUCTOS_T
             query = """
                 INSERT INTO PRODUCTOS_T (TITULOS_PROD, PRECIO_PROD, URL_IMG_PROD, TIENDA_PROD)
                 VALUES (?, ?, ?, ?)
@@ -31,7 +38,8 @@ class SqlServerPipeline:
         except Exception as e:
             self.connection.rollback()
             spider.logger.error(f"Error al guardar en la base de datos: {e}")
-        return item
+        
+        return item # Es importante retornar el item si se procesó correctamente
 
     def close_spider(self, spider):
         self.cursor.close()
