@@ -351,4 +351,4 @@ class SorianaSpider(scrapy.Spider):
         url = request.url
         if any(d in url for d in ("google-analytics.com", "googletagmanager.com", "facebook.net", "doubleclick.net")):
             return await route.abort()
-        return await route.continue_()
+        return await route.continue_()              
