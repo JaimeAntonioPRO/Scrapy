@@ -250,19 +250,22 @@ class HebSpider(scrapy.Spider):
                 except Exception:
                     pass
 
+        # === AÑADIDO: EXTRAER IMAGEN ===
+        image_url = response.css('meta[property="og:image"]::attr(content)').get()
+
         # SKU
         sku = _extract_sku_any(response, response.url)
-
         currency = _extract_currency(response) or "MXN"
         in_stock = bool(response.css(".in-stock, .available, [data-availability='inStock']"))
 
+        # === CAMBIO CLAVE: Usa los nombres de campo que espera la pipeline ===
         yield {
+            'titulo': title,
+            'precio': price,
+            'url_imagen': image_url,
+            # Los siguientes campos son extra, la pipeline no los usará, pero es bueno tenerlos
             "store": "heb",
             "url": response.url,
-            "title": title,
             "sku": sku,
-            "price": price,
-            "price_raw": price_raw,
             "currency": currency,
-            "in_stock": in_stock,
         }

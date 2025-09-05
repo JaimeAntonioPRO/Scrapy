@@ -1,22 +1,34 @@
+# Usa una imagen base de Python delgada y eficiente
 FROM python:3.11-slim
 
-# Instalar dependencias que necesita Playwright en Linux
-RUN apt-get update && apt-get install -y \
-    wget gnupg ca-certificates libglib2.0-0 libnss3 libatk1.0-0 libatk-bridge2.0-0 \
-    libdrm2 libxkbcommon0 libgbm1 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libasound2 libatspi2.0-0 libx11-6 libx11-xcb1 libxcb1 \
-    libxext6 libxshmfence1 xvfb fonts-liberation libgtk-3-0 \
+# --- PASO 1: Instalar TODAS las dependencias del sistema en una sola capa ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Dependencias de Playwright
+    libglib2.0-0 libnss3 libatk1.0-0 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+    libgbm1 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libasound2 \
+    libatspi2.0-0 libx11-6 libx11-xcb1 libxcb1 libxext6 libxshmfence1 xvfb \
+    fonts-liberation libgtk-3-0 \
+    # Dependencias para el driver ODBC de SQL Server
+    curl gpg apt-transport-https \
+    unixodbc-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# === SECCIÓN CORREGIDA Y FINAL: Instala el driver de Microsoft ODBC ===
+# Este método es el correcto y más robusto para las versiones modernas de Debian/Ubuntu
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list && \
+    apt-get update && \
+    ACCEPT_EULA=Y apt-get install -y msodbcsql17 && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- PASO 2: Instalar dependencias de Python usando requirements.txt ---
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install --with-deps
 
-# Copiar tu proyecto dentro del contenedor
-COPY . /app
+# --- PASO 3: Copiar el código de tu aplicación ---
+COPY . .
 
-# Instalar dependencias Python + navegadores de Playwright
-RUN pip install --upgrade pip && \
-    pip install scrapy scrapy-playwright playwright && \
-    python -m playwright install --with-deps
-
-# Comando por defecto (puedes sobrescribirlo en docker run)
-CMD ["scrapy", "crawl", "soriana", "-O", "soriana_precios.jsonl", "-s", "LOG_LEVEL=INFO"]
+# --- PASO 4: Comando por defecto ---
+CMD ["scrapy", "crawl", "soriana"]

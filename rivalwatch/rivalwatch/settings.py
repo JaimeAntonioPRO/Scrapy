@@ -35,3 +35,10 @@ DEFAULT_REQUEST_HEADERS = {
 }
 
 FEED_EXPORT_ENCODING = "utf-8"
+
+
+# === AÑADE ESTO AL FINAL DEL ARCHIVO ===
+# Activa el pipeline para que los datos se guarden en SQL Server
+ITEM_PIPELINES = {
+   'rivalwatch.pipelines.SqlServerPipeline': 300,
+}

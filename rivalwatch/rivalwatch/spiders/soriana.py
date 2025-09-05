@@ -103,16 +103,6 @@ class SorianaSpider(scrapy.Spider):
 
     # -------- ARRANQUE --------
     def start_requests(self):
-        """
-        Modos soportados:
-        - -a product_urls="url1,url2,..."
-        - -a query="nombre 1, nombre 2"
-        - default: start_urls (categorías)
-        Adicional:
-        - -a max_products=NN
-        - -a max_pages=NN
-        - -a require_terms=true (filtra resultados que no contengan todas las palabras del query)
-        """
         self.max_products = int(getattr(self, "max_products", 0)) or None
         self.max_pages = int(getattr(self, "max_pages", 0)) or None
         self.require_terms = str(getattr(self, "require_terms", "false")).lower() in ("1", "true", "yes")
@@ -126,10 +116,7 @@ class SorianaSpider(scrapy.Spider):
         query = getattr(self, "query", None)
         if query:
             for q in [t.strip() for t in query.split(",") if t.strip()]:
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # AQUÍ el cambio a /buscar?q= usando quote_plus
                 search_url = f"https://www.soriana.com/buscar?q={quote_plus(q)}"
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
                 yield scrapy.Request(
                     search_url,
                     callback=self.parse_search,
@@ -140,7 +127,6 @@ class SorianaSpider(scrapy.Spider):
                             PageMethod("route", "**/*", self._route_block_noise),
                             PageMethod("wait_for_load_state", "domcontentloaded"),
                             PageMethod("wait_for_load_state", "networkidle"),
-                            # al menos un link de producto visible
                             PageMethod(
                                 "wait_for_selector",
                                 "a.vtex-product-summary-2-x-clearLink, a[data-testid='productSummaryLink'], a[href$='.html']",
@@ -173,7 +159,6 @@ class SorianaSpider(scrapy.Spider):
         yielded = 0
         for url in self._iter_product_links(response):
             if self.require_terms:
-                # filtramos por título de la tarjeta cuando esté disponible
                 card_title = (
                     response.xpath(f'//a[@href="{urlparse(url).path}"]//text()').get()
                     or ""
@@ -275,35 +260,35 @@ class SorianaSpider(scrapy.Spider):
                 dont_filter=True,
             )
             return
+        
+        # === AÑADIDO: EXTRAER IMAGEN ===
+        image_url = response.css('meta[property="og:image"]::attr(content)').get()
 
         currency = _extract_currency(response) or "MXN"
         title = (response.css("h1::text").get() or "").strip()
         sku = _extract_sku(response, response.url)
         in_stock = bool(response.css(".in-stock, .available, [data-availability='inStock']"))
 
+        # === CAMBIO CLAVE: Usa los nombres de campo que espera la pipeline ===
         yield {
+            'titulo': title,
+            'precio': price,
+            'url_imagen': image_url,
+            # Los siguientes campos son extra, la pipeline no los usará
             "store": "soriana",
             "url": response.url,
-            "title": title,
             "sku": sku,
-            "price": price,
-            "price_raw": price_raw,
             "currency": currency,
-            "in_stock": in_stock,
         }
 
     # -------- Utilidades de listado --------
     def _iter_product_links(self, response):
-        """
-        Devuelve URLs absolutas de fichas de producto, evitando enlaces a páginas estáticas.
-        """
         sels = [
             'a.vtex-product-summary-2-x-clearLink::attr(href)',
             'a.product-card__link::attr(href)',
             'a.product-item__link::attr(href)',
             'section [data-sku] a::attr(href)',
             'a[data-testid="productSummaryLink"]::attr(href)',
-            # fallback general: páginas con .../NNNNN.html
             'a[href$=".html"]::attr(href)',
         ]
         seen = set()
@@ -313,10 +298,8 @@ class SorianaSpider(scrapy.Spider):
                 if not href:
                     continue
                 abs_url = response.urljoin(href)
-                # filtrar obvios NO-producto
                 if any(x in abs_url for x in ("/static-pages/", "/blog/", "/tiendas/", "/servicios/")):
                     continue
-                # VTEX producto típico termina en .html y suele incluir un id numérico
                 if not abs_url.endswith(".html"):
                     continue
                 if abs_url in seen:
@@ -335,7 +318,6 @@ class SorianaSpider(scrapy.Spider):
             url = response.css(nsel).get()
             if url:
                 return url
-        # algunos listados usan ?page=2,3... en el mismo path
         m = re.search(r'(?:[?&])page=(\d+)', response.url)
         if m:
             cur = int(m.group(1))
@@ -344,11 +326,10 @@ class SorianaSpider(scrapy.Spider):
 
     # -------- Playwright: bloquear ruido --------
     async def _route_block_noise(self, route, request):
-        """Bloquea recursos pesados: imágenes, fuentes y tracking para acelerar listados."""
         rtype = request.resource_type
         if rtype in ("image", "font", "media"):
             return await route.abort()
         url = request.url
         if any(d in url for d in ("google-analytics.com", "googletagmanager.com", "facebook.net", "doubleclick.net")):
             return await route.abort()
-        return await route.continue_()              
+        return await route.continue_()
