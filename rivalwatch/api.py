@@ -8,28 +8,28 @@ asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pyodbc
-import subprocess # Para poder ejecutar comandos del sistema (como 'scrapy crawl')
-import os # Para construir rutas de archivos de forma segura
+import subprocess 
+import os 
 
 # 2. Configuración inicial de Flask
 app = Flask(__name__)
-# CORS permite que tu frontend (React) se comunique con este backend sin problemas de seguridad del navegador
+
 CORS(app) 
 
 # 3. Función para conectar a la Base de Datos
-# Centralizamos la conexión para no repetir el código.
+
 def get_db_connection():
-    # --- ¡IMPORTANTE! MODIFICA ESTOS DATOS CON LOS TUYOS ---
+   
     connection = pyodbc.connect(
         'DRIVER={ODBC Driver 17 for SQL Server};'
-        'SERVER=localhost;'                  # O el nombre/IP de tu servidor SQL
-        'DATABASE=BASE_SCRAPY;'          # El nombre de tu base de datos
-        'UID=sa;'                    # Tu usuario de SQL Server
-        'PWD=prointernet;'                 # Tu contraseña
+        'SERVER=localhost;'                 
+        'DATABASE=BASE_SCRAPY;'         
+        'UID=sa;'                    
+        'PWD=prointernet;'              
     )
     return connection
 
-# 4. Definición de las rutas (Endpoints) del API
+
 
 # --- ENDPOINT PARA OBTENER LOS PRODUCTOS DE LA BASE DE DATOS ---
 @app.route('/api/productos', methods=['GET'])
@@ -70,14 +70,12 @@ def get_productos():
         return jsonify({"error": f"Error al conectar o consultar la base de datos: {str(e)}"}), 500
 
 
-# api.py
 
-# api.py
 
-# --- ENDPOINT CORRECTO Y SIMPLIFICADO ---
-# api.py
 
-# ... (tus imports y otras funciones se quedan igual)
+
+
+
 
 @app.route('/api/iniciar-spider', methods=['POST'])
 def iniciar_spider():
@@ -90,9 +88,7 @@ def iniciar_spider():
         return jsonify({"error": "El nombre del spider y el término de búsqueda son requeridos"}), 400
 
     try:
-        # --- ESTE ES EL NUEVO COMANDO ---
-        # En lugar de 'scrapy crawl', ahora usamos 'docker run'
-        # para lanzar el spider dentro de un contenedor.
+        # Construimos el comando de Docker
         comando = (
             f"docker run --rm rivalwatch-app "
             f"scrapy crawl {nombre_spider} "
@@ -111,10 +107,9 @@ def iniciar_spider():
     except Exception as e:
         return jsonify({"error": f"Error al intentar ejecutar el contenedor Docker: {str(e)}"}), 500
 
-# ... (el resto de tu archivo api.py se queda igual)
+
 
 # 5. Punto de entrada para ejecutar el servidor Flask
 if __name__ == '__main__':
-    # debug=True hace que el servidor se reinicie automáticamente cuando guardas cambios.
-    # Quítalo cuando pases a producción.
+
     app.run(debug=True, port=5000)

@@ -1,110 +1,98 @@
-# heb.py (Versión final con Playwright)
-import json
-import re
-from decimal import Decimal, InvalidOperation
-from urllib.parse import quote_plus
+# heb.py (Versión Definitiva Final - Corregida para aceptar respuesta 206)
 import scrapy
-from scrapy_playwright.page import PageMethod # Importamos PageMethod
+import json
 import unicodedata
-
-def _to_float(x: str) -> float | None:
-    if not x:
-        return None
-    s = str(x).strip().replace("$", "").replace(",", "")
-    if not s:
-        return None
-    try:
-        return float(Decimal(s))
-    except (InvalidOperation, TypeError):
-        return None
+import logging
+from urllib.parse import quote_plus
 
 class HebSpider(scrapy.Spider):
     name = "heb"
     allowed_domains = ["heb.com.mx"]
+    
+    # El token de segmento para "HEB Vic. Campestre"
+    segment_token = "eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIxIiwicHJpY2VUYWJsZXMiOm51bGwsInJlZ2lvbklkIjpudWxsLCJ1dG1fY2FtcGFpZ24iOm51bGwsInV0bV9zb3VyY2UiOm51bGwsInV0bWlfcGNhcnRhbyI6bnVsbCwiY3VycmVuY3kiOnsiY29kZSI6Ik1YTiIsInN5bWJvbCI6IiQifSwic2VsbGVycyI6W3siaWQiOiIyIiwibmFtZSI6IkhFQiBWaWMuIENhbXBlc3RyZSJ9XSwiY2hhbm5lbFByaXZhY3kiOiJwdWJsaWMifQ=="
+    
+    custom_settings = {
+        'ROBOTSTXT_OBEY': False,
+        'TWISTED_REACTOR': 'twisted.internet.asyncioreactor.AsyncioSelectorReactor',
+    }
 
-    def start_requests(self):
+    def __init__(self, *args, **kwargs):
+        super(HebSpider, self).__init__(*args, **kwargs)
         self.scraped_count = 0
+        self.page = 0
         self.max_products = int(getattr(self, "max_products", 50))
+        self.query = getattr(self, "query", None)
         
-        query = getattr(self, "query", None)
-        if not query:
-            self.logger.error("No se proporcionó un término de búsqueda ('query').")
+    def start_requests(self):
+        if not self.query:
+            self.logger.error("No se proporcionó un término de búsqueda ('query'). Usa -a query='tu_busqueda'")
             return
 
-        slug = unicodedata.normalize('NFKD', query).encode('ascii', 'ignore').decode('utf-8').lower().replace(' ', '-')
-        url = f"https://www.heb.com.mx/{slug}?_q={quote_plus(query)}&map=ft"
+        yield self._make_api_request()
+
+    def _make_api_request(self):
+        _from = self.page * 24
+        _to = (self.page + 1) * 24 - 1
         
-        # Usamos Playwright para la página de listado para asegurar que cargue
-        yield scrapy.Request(
-            url, 
-            callback=self.parse_listing,
-            meta={
-                "playwright": True,
-                "playwright_page_methods": [
-                    PageMethod("wait_for_selector", "section a[href*='/p']", timeout=30000),
-                ],
-            }
+        slug = unicodedata.normalize('NFKD', self.query).encode('ascii', 'ignore').decode('utf-8').lower().replace(' ', '-')
+        
+        api_url = (
+            f"https://www.heb.com.mx/api/catalog_system/pub/products/search/{slug}"
+            f"?_q={quote_plus(self.query)}&map=ft&_from={_from}&_to={_to}"
+        )
+        
+        self.logger.info(f"Realizando petición a la API, página {self.page + 1}")
+        
+        return scrapy.Request(
+            url=api_url,
+            callback=self.parse_api,
+            errback=self.errback_api,
+            cookies={'vtex_segment': self.segment_token}
         )
 
-    def parse_listing(self, response):
-        product_links = response.css('section a[href*="/p"]::attr(href)').getall()
-        
-        for link in product_links:
+    def parse_api(self, response):
+        # --- CORRECCIÓN CLAVE ---
+        # Aceptamos tanto 200 (OK) como 206 (Contenido Parcial) como respuestas válidas.
+        if response.status not in [200, 206]:
+            self.logger.error(f"La API devolvió un error inesperado {response.status}. Contenido: {response.text}")
+            return
+            
+        try:
+            products = json.loads(response.text)
+        except json.JSONDecodeError:
+            self.logger.error(f"No se pudo decodificar el JSON de la API. Status: {response.status}, Contenido: {response.text}")
+            return
+
+        if not products:
+            self.logger.info("No se encontraron más productos. Finalizando.")
+            return
+
+        for product in products:
             if self.scraped_count >= self.max_products:
-                self.logger.info(f"Límite de {self.max_products} productos alcanzado.")
-                return 
+                self.logger.info(f"Límite de {self.max_products} productos alcanzado. Finalizando.")
+                return
 
-            full_url = response.urljoin(link)
+            items = product.get('items', [])
+            if not items: continue
             
-            # Usamos Playwright para la página de producto, esperando a que el precio aparezca
-            yield scrapy.Request(
-                full_url, 
-                callback=self.parse_product,
-                meta={
-                    "playwright": True,
-                    "playwright_page_methods": [
-                        # Esta es la clave: espera a que CUALQUIERA de estos selectores de precio esté visible
-                        PageMethod("wait_for_selector", "div.price, span[class*='currencyInteger'], span[class*='sellingPrice']", timeout=20000),
-                    ],
-                }
-            )
+            sellers = items[0].get('sellers', [])
+            if not sellers: continue
+            
+            price_info = sellers[0].get('commertialOffer', {})
+            images = items[0].get('images', [])
+            image_url = images[0].get('imageUrl') if images else None
+            
+            yield {
+                'titulo': product.get('productName'),
+                'precio': price_info.get('Price'),
+                'url_imagen': image_url,
+            }
             self.scraped_count += 1
-            
-        # Lógica de paginación
+        
         if self.scraped_count < self.max_products:
-            next_page = response.css('a[rel="next"]::attr(href)').get()
-            if next_page:
-                yield response.follow(next_page, callback=self.parse_listing, meta={"playwright": True})
+            self.page += 1
+            yield self._make_api_request()
 
-    def parse_product(self, response):
-        title = (response.css("h1 span[class*='productName']::text").get() or 
-                 response.css('meta[property="og:title"]::attr(content)').get() or "").strip()
-
-        image_url = (response.css('img[class*="productImageTag"]::attr(src)').get() or 
-                     response.css('meta[property="og:image"]::attr(content)').get())
-        
-        price = None
-        # Como ya esperamos a que el precio cargue, ahora la extracción es mucho más fiable
-        
-        # Intento 1: Precio dividido (entero + fracción)
-        integer_part = response.css("span[class*='currencyInteger']::text").get()
-        if integer_part:
-            fraction_part = response.css("span[class*='currencyFraction']::text").get() or "00"
-            price = _to_float(f"{integer_part}.{fraction_part}")
-
-        # Intento 2: Precio en un solo contenedor
-        if not price:
-            price_text = response.css("div.price ::text").getall()
-            if price_text:
-                price = _to_float("".join(price_text))
-
-        # Intento 3: Otro contenedor común
-        if not price:
-             price_text = response.css("span[class*='sellingPrice']::text").get()
-             price = _to_float(price_text)
-
-        yield {
-            'titulo': title,
-            'precio': price,
-            'url_imagen': image_url,
-        }
+    def errback_api(self, failure):
+        self.logger.error(f"Error al contactar la API: {failure.value}")

@@ -40,3 +40,9 @@ FEED_EXPORT_ENCODING = "utf-8"
 ITEM_PIPELINES = {
    'rivalwatch.pipelines.SqlServerPipeline': 300,
 }
+
+
+# ... (tus otras configuraciones)
+
+# --- CONFIGURACIÓN PARA DEPURACIÓN VISUAL DE PLAYWRIGHT ---
+# Le decimos a Playwright que inicie el navegador con una interfaz visible.
